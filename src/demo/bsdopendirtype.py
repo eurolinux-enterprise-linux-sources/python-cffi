@@ -1,22 +1,4 @@
-from cffi import FFI
-
-ffi = FFI()
-ffi.cdef("""
-    typedef ... DIR;
-    struct dirent {
-        unsigned char d_type;   /* type of file */
-        char d_name[];          /* filename */
-        ...;
-    };
-    DIR *opendir(const char *name);
-    int closedir(DIR *dirp);
-    struct dirent *readdir(DIR *dirp);
-    static const int DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK;
-""")
-lib = ffi.verify("""
-    #include <sys/types.h>
-    #include <dirent.h>
-""")
+from _bsdopendirtype import ffi, lib
 
 
 def _posix_error():
@@ -34,10 +16,10 @@ _dtype_to_smode = {
 
 def opendir(dir):
     if len(dir) == 0:
-        dir = '.'
+        dir = b'.'
     dirname = dir
-    if not dirname.endswith('/'):
-        dirname += '/'
+    if not dirname.endswith(b'/'):
+        dirname += b'/'
     dirp = lib.opendir(dir)
     if dirp == ffi.NULL:
         raise _posix_error()
@@ -50,7 +32,7 @@ def opendir(dir):
                     raise _posix_error()
                 return
             name = ffi.string(dirent.d_name)
-            if name == '.' or name == '..':
+            if name == b'.' or name == b'..':
                 continue
             name = dirname + name
             try:
@@ -60,3 +42,7 @@ def opendir(dir):
             yield name, smode
     finally:
         lib.closedir(dirp)
+
+if __name__ == '__main__':
+    for name, smode in opendir(b'/tmp'):
+        print(hex(smode), name)

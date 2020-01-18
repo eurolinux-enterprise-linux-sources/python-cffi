@@ -19,10 +19,11 @@ def _ask_pkg_config(resultlist, option, result_prefix='', sysroot=False):
         p = subprocess.Popen([pkg_config, option, 'libffi'],
                              stdout=subprocess.PIPE)
     except OSError as e:
-        if e.errno != errno.ENOENT:
+        if e.errno not in [errno.ENOENT, errno.EACCES]:
             raise
     else:
         t = p.stdout.read().decode().strip()
+        p.stdout.close()
         if p.wait() == 0:
             res = t.split()
             # '-I/usr/...' -> '/usr/...'
@@ -41,6 +42,15 @@ def _ask_pkg_config(resultlist, option, result_prefix='', sysroot=False):
             #
             resultlist[:] = res
 
+def no_working_compiler_found():
+    sys.stderr.write("""
+    No working compiler found, or bogus compiler options
+    passed to the compiler from Python's distutils module.
+    See the error messages above.
+    (If they are about -mno-fused-madd and you are on OS/X 10.8,
+    see http://stackoverflow.com/questions/22313407/ .)\n""")
+    sys.exit(1)
+
 def ask_supports_thread():
     from distutils.core import Distribution
     from distutils.sysconfig import get_config_vars
@@ -50,15 +60,30 @@ def ask_supports_thread():
     if ok:
         define_macros.append(('USE__THREAD', None))
     else:
+        ok1 = config.try_compile('int some_regular_variable_42;')
+        if not ok1:
+            no_working_compiler_found()
         sys.stderr.write("Note: will not use '__thread' in the C code\n")
         sys.stderr.write("The above error message can be safely ignored\n")
 
 def use_pkg_config():
+    if sys.platform == 'darwin' and os.path.exists('/usr/local/bin/brew'):
+        use_homebrew_for_libffi()
+
     _ask_pkg_config(include_dirs,       '--cflags-only-I', '-I', sysroot=True)
     _ask_pkg_config(extra_compile_args, '--cflags-only-other')
     _ask_pkg_config(library_dirs,       '--libs-only-L', '-L', sysroot=True)
     _ask_pkg_config(extra_link_args,    '--libs-only-other')
     _ask_pkg_config(libraries,          '--libs-only-l', '-l')
+
+def use_homebrew_for_libffi():
+    # We can build by setting:
+    # PKG_CONFIG_PATH = $(brew --prefix libffi)/lib/pkgconfig
+    with os.popen('brew --prefix libffi') as brew_prefix_cmd:
+        prefix = brew_prefix_cmd.read().strip()
+    pkgconfig = os.path.join(prefix, 'lib', 'pkgconfig')
+    os.environ['PKG_CONFIG_PATH'] = (
+        os.environ.get('PKG_CONFIG_PATH', '') + ':' + pkgconfig)
 
 
 if sys.platform == 'win32':
@@ -85,21 +110,25 @@ else:
     use_pkg_config()
     ask_supports_thread()
 
+if 'freebsd' in sys.platform:
+    include_dirs.append('/usr/local/include')
+
 
 if __name__ == '__main__':
-    from setuptools import setup, Extension
-    ext_modules = []
-    if '__pypy__' not in sys.modules:
-        ext_modules.append(Extension(
-            name='_cffi_backend',
-            include_dirs=include_dirs,
-            sources=sources,
-            libraries=libraries,
-            define_macros=define_macros,
-            library_dirs=library_dirs,
-            extra_compile_args=extra_compile_args,
-            extra_link_args=extra_link_args,
-        ))
+    from setuptools import setup, Distribution, Extension
+
+    class CFFIDistribution(Distribution):
+        def has_ext_modules(self):
+            # Event if we don't have extension modules (e.g. on PyPy) we want to
+            # claim that we do so that wheels get properly tagged as Python
+            # specific.  (thanks dstufft!)
+            return True
+
+    # On PyPy, cffi is preinstalled and it is not possible, at least for now,
+    # to install a different version.  We work around it by making the setup()
+    # arguments mostly empty in this case.
+    cpython = ('_cffi_backend' not in sys.builtin_module_names)
+
     setup(
         name='cffi',
         description='Foreign Function Interface for Python calling C code.',
@@ -115,8 +144,11 @@ Contact
 
 `Mailing list <https://groups.google.com/forum/#!forum/python-cffi>`_
 """,
-        version='0.8.6',
-        packages=['cffi'],
+        version='1.6.0',
+        packages=['cffi'] if cpython else [],
+        package_data={'cffi': ['_cffi_include.h', 'parse_c_type.h', 
+                               '_embedding.h']}
+                     if cpython else {},
         zip_safe=False,
 
         url='http://cffi.readthedocs.org',
@@ -125,11 +157,28 @@ Contact
 
         license='MIT',
 
-        ext_modules=ext_modules,
+        distclass=CFFIDistribution,
+        ext_modules=[Extension(
+            name='_cffi_backend',
+            include_dirs=include_dirs,
+            sources=sources,
+            libraries=libraries,
+            define_macros=define_macros,
+            library_dirs=library_dirs,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+        )] if cpython else [],
 
         install_requires=[
             'pycparser',
-        ],
+        ] if cpython else [],
+
+        entry_points = {
+            "distutils.setup_keywords": [
+                "cffi_modules = cffi.setuptools_ext:cffi_modules",
+            ],
+        } if cpython else {},
+
         classifiers=[
             'Programming Language :: Python',
             'Programming Language :: Python :: 2',
@@ -138,5 +187,8 @@ Contact
             'Programming Language :: Python :: 3',
             'Programming Language :: Python :: 3.2',
             'Programming Language :: Python :: 3.3',
+            'Programming Language :: Python :: 3.4',
+            'Programming Language :: Python :: Implementation :: CPython',
+            'Programming Language :: Python :: Implementation :: PyPy',
         ],
     )

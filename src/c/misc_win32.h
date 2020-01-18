@@ -1,44 +1,69 @@
 #include <malloc.h>   /* for alloca() */
 
+
 /************************************************************/
 /* errno and GetLastError support */
 
-struct cffi_errno_s {
-    int saved_errno;
-    int saved_lasterror;
-};
+#include "misc_thread_common.h"
 
-static DWORD cffi_tls_index;
+static DWORD cffi_tls_index = TLS_OUT_OF_INDEXES;
 
-static void init_errno(void)
+BOOL WINAPI DllMain(HINSTANCE hinstDLL,
+                    DWORD     reason_for_call,
+                    LPVOID    reserved)
 {
-    cffi_tls_index = TlsAlloc();
-    if (cffi_tls_index == TLS_OUT_OF_INDEXES)
-        PyErr_SetString(PyExc_WindowsError, "TlsAlloc() failed");
+    LPVOID p;
+
+    switch (reason_for_call) {
+
+    case DLL_THREAD_DETACH:
+        if (cffi_tls_index != TLS_OUT_OF_INDEXES) {
+            p = TlsGetValue(cffi_tls_index);
+            if (p != NULL) {
+                TlsSetValue(cffi_tls_index, NULL);
+                cffi_thread_shutdown(p);
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+    return TRUE;
 }
 
-static struct cffi_errno_s *_geterrno_object(void)
+static void init_cffi_tls(void)
+{
+    if (cffi_tls_index == TLS_OUT_OF_INDEXES) {
+        cffi_tls_index = TlsAlloc();
+        if (cffi_tls_index == TLS_OUT_OF_INDEXES)
+            PyErr_SetString(PyExc_WindowsError, "TlsAlloc() failed");
+    }
+}
+
+static struct cffi_tls_s *get_cffi_tls(void)
 {
     LPVOID p = TlsGetValue(cffi_tls_index);
 
     if (p == NULL) {
-        /* XXX this malloc() leaks */
-        p = malloc(sizeof(struct cffi_errno_s));
+        p = malloc(sizeof(struct cffi_tls_s));
         if (p == NULL)
             return NULL;
-        memset(p, 0, sizeof(struct cffi_errno_s));
+        memset(p, 0, sizeof(struct cffi_tls_s));
         TlsSetValue(cffi_tls_index, p);
     }
-    return (struct cffi_errno_s *)p;
+    return (struct cffi_tls_s *)p;
 }
+
+#ifdef USE__THREAD
+# error "unexpected USE__THREAD on Windows"
+#endif
 
 static void save_errno(void)
 {
     int current_err = errno;
     int current_lasterr = GetLastError();
-    struct cffi_errno_s *p;
-
-    p = _geterrno_object();
+    struct cffi_tls_s *p = get_cffi_tls();
     if (p != NULL) {
         p->saved_errno = current_err;
         p->saved_lasterror = current_lasterr;
@@ -46,23 +71,9 @@ static void save_errno(void)
     /* else: cannot report the error */
 }
 
-static void save_errno_only(void)
-{
-    int current_err = errno;
-    struct cffi_errno_s *p;
-
-    p = _geterrno_object();
-    if (p != NULL) {
-        p->saved_errno = current_err;
-    }
-    /* else: cannot report the error */
-}
-
 static void restore_errno(void)
 {
-    struct cffi_errno_s *p;
-
-    p = _geterrno_object();
+    struct cffi_tls_s *p = get_cffi_tls();
     if (p != NULL) {
         SetLastError(p->saved_lasterror);
         errno = p->saved_errno;
@@ -70,31 +81,23 @@ static void restore_errno(void)
     /* else: cannot report the error */
 }
 
-static void restore_errno_only(void)
-{
-    struct cffi_errno_s *p;
+/************************************************************/
 
-    p = _geterrno_object();
-    if (p != NULL) {
-        errno = p->saved_errno;
-    }
-    /* else: cannot report the error */
-}
 
 #if PY_MAJOR_VERSION >= 3
-static PyObject *b_getwinerror(PyObject *self, PyObject *args)
+static PyObject *b_getwinerror(PyObject *self, PyObject *args, PyObject *kwds)
 {
     int err = -1;
     int len;
     WCHAR *s_buf = NULL; /* Free via LocalFree */
     PyObject *v, *message;
+    static char *keywords[] = {"code", NULL};
 
-    if (!PyArg_ParseTuple(args, "|i", &err))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i", keywords, &err))
         return NULL;
 
     if (err == -1) {
-        struct cffi_errno_s *p;
-        p = _geterrno_object();
+        struct cffi_tls_s *p = get_cffi_tls();
         if (p == NULL)
             return PyErr_NoMemory();
         err = p->saved_lasterror;
@@ -129,21 +132,21 @@ static PyObject *b_getwinerror(PyObject *self, PyObject *args)
     return v;
 }
 #else
-static PyObject *b_getwinerror(PyObject *self, PyObject *args)
+static PyObject *b_getwinerror(PyObject *self, PyObject *args, PyObject *kwds)
 {
     int err = -1;
     int len;
     char *s;
     char *s_buf = NULL; /* Free via LocalFree */
-    char s_small_buf[28]; /* Room for "Windows Error 0xFFFFFFFF" */
+    char s_small_buf[40]; /* Room for "Windows Error 0xFFFFFFFFFFFFFFFF" */
     PyObject *v;
+    static char *keywords[] = {"code", NULL};
 
-    if (!PyArg_ParseTuple(args, "|i", &err))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i", keywords, &err))
         return NULL;
 
     if (err == -1) {
-        struct cffi_errno_s *p;
-        p = _geterrno_object();
+        struct cffi_tls_s *p = get_cffi_tls();
         if (p == NULL)
             return PyErr_NoMemory();
         err = p->saved_lasterror;
@@ -177,6 +180,7 @@ static PyObject *b_getwinerror(PyObject *self, PyObject *args)
     return v;
 }
 #endif
+
 
 /************************************************************/
 /* Emulate dlopen()&co. from the Windows API */
@@ -216,9 +220,9 @@ static void *dlsym(void *handle, const char *symbol)
     return address;
 }
 
-static void dlclose(void *handle)
+static int dlclose(void *handle)
 {
-    FreeLibrary((HMODULE)handle);
+    return FreeLibrary((HMODULE)handle) ? 0 : -1;
 }
 
 static const char *dlerror(void)
